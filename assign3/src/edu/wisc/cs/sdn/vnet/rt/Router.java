@@ -7,7 +7,11 @@ import edu.wisc.cs.sdn.vnet.Iface;
 import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.IPv4;
 import net.floodlightcontroller.packet.RIPv2;
+import net.floodlightcontroller.packet.RIPv2Entry;
 import net.floodlightcontroller.packet.UDP;
+
+import java.util.Timer;
+import java.util.TimerTask;
 
 /**
  * @author Aaron Gember-Jacobson and Anubhavnidhi Abhashkumar
@@ -20,6 +24,9 @@ public class Router extends Device
 	/** Broadcast destination MAC address used for RIP request/response flooding */
 	private static final String RIP_BROADCAST_MAC = "FF:FF:FF:FF:FF:FF";
 
+	/** Period for unsolicited RIP responses */
+	private static final long RIP_PERIOD_MS = 10_000L;
+
 	/** Routing table for the router */
 	private RouteTable routeTable;
 	
@@ -28,6 +35,9 @@ public class Router extends Device
 
 	/** Whether RIP mode is enabled */
 	private boolean ripEnabled;
+
+	/** Periodic task timer for unsolicited RIP responses */
+	private Timer ripResponseTimer;
 	
 	/**
 	 * Creates a router for a specific host.
@@ -39,6 +49,7 @@ public class Router extends Device
 		this.routeTable = new RouteTable();
 		this.arpCache = new ArpCache();
 		this.ripEnabled = false;
+		this.ripResponseTimer = null;
 	}
 	
 	/**
@@ -97,6 +108,7 @@ public class Router extends Device
 		this.ripEnabled = true;
 		this.addDirectlyConnectedRoutes();
 		this.sendInitialRIPRequests();
+		this.startPeriodicRIPResponses();
 	}
 
 	/**
@@ -162,6 +174,133 @@ public class Router extends Device
 	}
 
 	/**
+	 * Begin periodic unsolicited RIP responses every 10 seconds.
+	 */
+	private void startPeriodicRIPResponses()
+	{
+		if (this.ripResponseTimer != null)
+		{ return; }
+
+		this.ripResponseTimer = new Timer(true);
+		this.ripResponseTimer.scheduleAtFixedRate(new TimerTask()
+		{
+			@Override
+			public void run()
+			{ sendUnsolicitedRIPResponses(); }
+		}, RIP_PERIOD_MS, RIP_PERIOD_MS);
+	}
+
+	/**
+	 * Determine whether an IP packet is a RIP packet.
+	 * RIP packets are UDP packets with destination port 520.
+	 */
+	private boolean isRIPPacket(IPv4 ipPacket)
+	{
+		if (ipPacket.getProtocol() != IPv4.PROTOCOL_UDP)
+		{ return false; }
+		if (!(ipPacket.getPayload() instanceof UDP))
+		{ return false; }
+
+		UDP udpPacket = (UDP)ipPacket.getPayload();
+		return (udpPacket.getDestinationPort() == UDP.RIP_PORT);
+	}
+
+	/**
+	 * Handle a RIP packet that arrived on an interface.
+	 */
+	private void handleRIPPacket(Ethernet etherPacket, IPv4 ipPacket, Iface inIface)
+	{
+		if (!(ipPacket.getPayload() instanceof UDP))
+		{ return; }
+
+		UDP udpPacket = (UDP)ipPacket.getPayload();
+		if (!(udpPacket.getPayload() instanceof RIPv2))
+		{ return; }
+
+		RIPv2 ripPacket = (RIPv2)udpPacket.getPayload();
+		if (ripPacket.getCommand() == RIPv2.COMMAND_REQUEST)
+		{
+			// respond directly to the requesting router interface
+			this.sendUnicastRIPResponse(inIface,
+					ipPacket.getSourceAddress(),
+					etherPacket.getSourceMACAddress());
+		}
+		// Response handling and route learning are implemented in a later
+		// checkpoint.
+	}
+
+	/**
+	 * Send unsolicited RIP responses out all interfaces.
+	 */
+	private void sendUnsolicitedRIPResponses()
+	{
+		for (Iface iface : this.interfaces.values())
+		{
+			this.sendRIPResponse(iface, RIP_MULTICAST_IP,
+					Ethernet.toMACAddress(RIP_BROADCAST_MAC));
+		}
+	}
+
+	/**
+	 * Send a unicast RIP response to one router interface.
+	 */
+	private void sendUnicastRIPResponse(Iface outIface, int destinationIp,
+			byte[] destinationMac)
+	{
+		this.sendRIPResponse(outIface, destinationIp, destinationMac);
+	}
+
+	/**
+	 * Build and send a RIP response packet through one interface.
+	 */
+	private void sendRIPResponse(Iface outIface, int destinationIp,
+			byte[] destinationMac)
+	{
+		if (outIface.getMacAddress() == null || outIface.getIpAddress() == 0)
+		{ return; }
+
+		RIPv2 rip = new RIPv2();
+		rip.setCommand(RIPv2.COMMAND_RESPONSE);
+		this.addRIPResponseEntries(rip);
+
+		UDP udp = new UDP();
+		udp.setSourcePort(UDP.RIP_PORT);
+		udp.setDestinationPort(UDP.RIP_PORT);
+		udp.setPayload(rip);
+
+		IPv4 ip = new IPv4();
+		ip.setTtl((byte)64);
+		ip.setSourceAddress(outIface.getIpAddress());
+		ip.setDestinationAddress(destinationIp);
+		ip.setPayload(udp);
+
+		Ethernet ether = new Ethernet();
+		ether.setEtherType(Ethernet.TYPE_IPv4);
+		ether.setSourceMACAddress(outIface.getMacAddress().toBytes());
+		ether.setDestinationMACAddress(destinationMac);
+		ether.setPayload(ip);
+
+		this.sendPacket(ether, outIface);
+	}
+
+	/**
+	 * Populate RIP response entries from currently directly connected subnets.
+	 * Learned entries are added in a later checkpoint.
+	 */
+	private void addRIPResponseEntries(RIPv2 rip)
+	{
+		for (Iface iface : this.interfaces.values())
+		{
+			if ((iface.getIpAddress() == 0) || (iface.getSubnetMask() == 0))
+			{ continue; }
+
+			int subnet = iface.getIpAddress() & iface.getSubnetMask();
+			RIPv2Entry entry = new RIPv2Entry(subnet, iface.getSubnetMask(), 1);
+			rip.addEntry(entry);
+		}
+	}
+
+	/**
 	 * Handle an Ethernet packet received on a specific interface.
 	 * 
 	 * @param etherPacket the Ethernet packet that was received
@@ -185,6 +324,13 @@ public class Router extends Device
 		short computedChecksum = ipPacket.getChecksum();
 		ipPacket.setChecksum(receivedChecksum);
 		if (receivedChecksum != computedChecksum) {
+			return;
+		}
+
+		// RIP traffic is handled locally (not via normal forwarding path)
+		if (this.ripEnabled && this.isRIPPacket(ipPacket))
+		{
+			this.handleRIPPacket(etherPacket, ipPacket, inIface);
 			return;
 		}
 
