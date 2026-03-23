@@ -38,6 +38,7 @@ public class Router extends Device
 
 	/** Periodic task timer for unsolicited RIP responses */
 	private Timer ripResponseTimer;
+	// TODO: add learned-route metadata storage keyed by destination+mask (metric, nextHop, lastUpdateMs, isDirect) for RIP DV
 	
 	/**
 	 * Creates a router for a specific host.
@@ -109,6 +110,7 @@ public class Router extends Device
 		this.addDirectlyConnectedRoutes();
 		this.sendInitialRIPRequests();
 		this.startPeriodicRIPResponses();
+		// TODO: start a periodic timeout sweep that expires learned (non-direct) routes not refreshed for >30s
 	}
 
 	/**
@@ -225,8 +227,14 @@ public class Router extends Device
 					ipPacket.getSourceAddress(),
 					etherPacket.getSourceMACAddress());
 		}
-		// Response handling and route learning are implemented in a later
-		// checkpoint.
+		else if (ripPacket.getCommand() == RIPv2.COMMAND_RESPONSE)
+		{
+			// TODO: process RIP response entries and update route table:
+			// - candidateMetric=min(received+1,16)
+			// - preserve direct routes
+			// - add/replace/refresh learned routes by next hop
+			// - treat metric 16 from current next hop as unreachable
+		}
 	}
 
 	/**
@@ -289,6 +297,7 @@ public class Router extends Device
 	 */
 	private void addRIPResponseEntries(RIPv2 rip)
 	{
+		// TODO: include learned routes in advertisements using stored RIP metrics (not only directly connected subnets)
 		for (Iface iface : this.interfaces.values())
 		{
 			if ((iface.getIpAddress() == 0) || (iface.getSubnetMask() == 0))
@@ -385,4 +394,6 @@ public class Router extends Device
 		etherPacket.setDestinationMACAddress(arpEntry.getMac().toBytes());
 		this.sendPacket(etherPacket, outIface);
 	}
+
+	// TODO: override destroy() to cancel RIP timers/tasks cleanly before calling super.destroy()
 }
