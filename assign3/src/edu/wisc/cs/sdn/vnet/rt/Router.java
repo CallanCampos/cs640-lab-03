@@ -223,7 +223,7 @@ public class Router extends Device
 		if (ripPacket.getCommand() == RIPv2.COMMAND_REQUEST)
 		{
 			// respond directly to the requesting router interface
-			this.sendUnicastRIPResponse(inIface,
+			this.sendRIPResponse(inIface,
 					ipPacket.getSourceAddress(),
 					etherPacket.getSourceMACAddress());
 		}
@@ -247,15 +247,6 @@ public class Router extends Device
 			this.sendRIPResponse(iface, RIP_MULTICAST_IP,
 					Ethernet.toMACAddress(RIP_BROADCAST_MAC));
 		}
-	}
-
-	/**
-	 * Send a unicast RIP response to one router interface.
-	 */
-	private void sendUnicastRIPResponse(Iface outIface, int destinationIp,
-			byte[] destinationMac)
-	{
-		this.sendRIPResponse(outIface, destinationIp, destinationMac);
 	}
 
 	/**
