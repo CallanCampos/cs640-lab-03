@@ -127,6 +127,10 @@ public class Router extends Device
 		if (outIface == null) {
 			return;
 		}
+		// never route a packet back out the interface it arrived on
+		if (outIface == inIface) {
+			return;
+		}
 		if (outIface.getMacAddress() == null) {
 			return;
 		}
