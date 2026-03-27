@@ -10,6 +10,8 @@ import net.floodlightcontroller.packet.RIPv2;
 import net.floodlightcontroller.packet.RIPv2Entry;
 import net.floodlightcontroller.packet.UDP;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -18,6 +20,17 @@ import java.util.TimerTask;
  */
 public class Router extends Device
 {	
+	private static class LearnedRoute {
+		//dest address and subnet mask
+		private int destinationAddress;
+		private int subnetMask;
+
+		private int metric;
+		private long lastUpdate;
+		private boolean directRoute;
+
+	}
+
 	/** RIP multicast destination IP address */
 	private static final int RIP_MULTICAST_IP = IPv4.toIPv4Address("224.0.0.9");
 
@@ -26,6 +39,9 @@ public class Router extends Device
 
 	/** Period for unsolicited RIP responses */
 	private static final long RIP_PERIOD_MS = 10_000L;
+
+	/** Period for route timeout in milliseconds */
+	private static final long ROUTE_TIMEOUT_MS = 30_000L;
 
 	/** Routing table for the router */
 	private RouteTable routeTable;
@@ -38,8 +54,11 @@ public class Router extends Device
 
 	/** Periodic task timer for unsolicited RIP responses */
 	private Timer ripResponseTimer;
-	// TODO: add learned-route metadata storage keyed by destination+mask (metric, nextHop, lastUpdateMs, isDirect) for RIP DV
+
 	
+	/** Map of learned routes keyed by destination+mask */
+	private Map<String, LearnedRoute> learnedRoutes;
+
 	/**
 	 * Creates a router for a specific host.
 	 * @param host hostname for the router
@@ -51,6 +70,7 @@ public class Router extends Device
 		this.arpCache = new ArpCache();
 		this.ripEnabled = false;
 		this.ripResponseTimer = null;
+		this.learnedRoutes = new HashMap<String, LearnedRoute>();
 	}
 	
 	/**
@@ -110,7 +130,7 @@ public class Router extends Device
 		this.addDirectlyConnectedRoutes();
 		this.sendInitialRIPRequests();
 		this.startPeriodicRIPResponses();
-		// TODO: start a periodic timeout sweep that expires learned (non-direct) routes not refreshed for >30s
+		
 	}
 
 	/**
@@ -124,8 +144,15 @@ public class Router extends Device
 			if ((iface.getIpAddress() == 0) || (iface.getSubnetMask() == 0))
 			{ continue; }
 
-			int subnet = iface.getIpAddress() & iface.getSubnetMask();
+			int ipAddress = iface.getIpAddress();
+			int subnetMask = iface.getSubnetMask();
+			
+			int subnet = ipAddress & subnetMask;
+
 			this.routeTable.insert(subnet, 0, iface.getSubnetMask(), iface);
+			//add to learned routes
+			String key = String.valueOf(subnet) + "/" + String.valueOf(subnetMask);
+			this.learnedRoutes.put(key, createLearnedRoute(subnet, subnetMask, 1, true));
 		}
 
 		System.out.println("Initialized directly connected routes for RIP");
@@ -154,6 +181,7 @@ public class Router extends Device
 
 		RIPv2 rip = new RIPv2();
 		rip.setCommand(RIPv2.COMMAND_REQUEST);
+		
 
 		UDP udp = new UDP();
 		udp.setSourcePort(UDP.RIP_PORT);
@@ -165,6 +193,8 @@ public class Router extends Device
 		ip.setSourceAddress(outIface.getIpAddress());
 		ip.setDestinationAddress(RIP_MULTICAST_IP);
 		ip.setPayload(udp);
+		ip.setProtocol(IPv4.PROTOCOL_UDP);
+		
 
 		Ethernet ether = new Ethernet();
 		ether.setEtherType(Ethernet.TYPE_IPv4);
@@ -223,17 +253,56 @@ public class Router extends Device
 		if (ripPacket.getCommand() == RIPv2.COMMAND_REQUEST)
 		{
 			// respond directly to the requesting router interface
+			//inface goes to ourface and source mac goes to dest mac
 			this.sendRIPResponse(inIface,
 					ipPacket.getSourceAddress(),
 					etherPacket.getSourceMACAddress());
 		}
+		//take in info of the response 
 		else if (ripPacket.getCommand() == RIPv2.COMMAND_RESPONSE)
 		{
-			// TODO: process RIP response entries and update route table:
-			// - candidateMetric=min(received+1,16)
-			// - preserve direct routes
-			// - add/replace/refresh learned routes by next hop
-			// - treat metric 16 from current next hop as unreachable
+
+			for (RIPv2Entry entry : ripPacket.getEntries()) {
+				int destAddr = entry.getAddress();
+				int subnetMask = entry.getSubnetMask();
+				int metric = entry.getMetric();
+
+				String routeKey = String.valueOf(destAddr) + "/" + String.valueOf(subnetMask);
+
+				if(this.learnedRoutes.containsKey(routeKey)) {
+					LearnedRoute learnedRoute = this.learnedRoutes.get(routeKey);
+					//check if route not directly connected to us, also prevents loops
+					if(!learnedRoute.directRoute) {
+					
+						//get cost of this route
+						int routeCost = metric + 1;
+						//if cost is 16, unreachable
+						if(routeCost == 16) {
+							this.learnedRoutes.remove(destAddr + "/" + subnetMask);
+							this.routeTable.remove(destAddr, subnetMask);
+						}
+						//if cost is less than current cost, update table
+						else if(routeCost < learnedRoute.metric){
+							this.learnedRoutes.put(routeKey,createLearnedRoute(destAddr, subnetMask, routeCost, false));
+							this.routeTable.update(destAddr,subnetMask,ipPacket.getSourceAddress(),inIface);
+						}
+						//if cost is same, keep route and update last update time
+						else if(routeCost == learnedRoute.metric){
+							learnedRoute.lastUpdate = System.currentTimeMillis();
+						}
+
+					}
+
+				}
+				//we havent learned this route yet, add if cost is under 16
+				else{
+					if(metric + 1 < 16) {
+						//next hop for us is whoever sent the response
+						this.learnedRoutes.put(routeKey, createLearnedRoute(destAddr, subnetMask, metric+ 1, false));
+						this.routeTable.insert(destAddr,ipPacket.getSourceAddress(),subnetMask,inIface);
+					}
+				}
+			}
 		}
 	}
 
@@ -272,6 +341,7 @@ public class Router extends Device
 		ip.setSourceAddress(outIface.getIpAddress());
 		ip.setDestinationAddress(destinationIp);
 		ip.setPayload(udp);
+		ip.setProtocol(IPv4.PROTOCOL_UDP);
 
 		Ethernet ether = new Ethernet();
 		ether.setEtherType(Ethernet.TYPE_IPv4);
@@ -283,21 +353,35 @@ public class Router extends Device
 	}
 
 	/**
-	 * Populate RIP response entries from currently directly connected subnets.
-	 * Learned entries are added in a later checkpoint.
+	 * Populate RIP response entries from currently learned routes.
 	 */
 	private void addRIPResponseEntries(RIPv2 rip)
 	{
-		// TODO: include learned routes in advertisements using stored RIP metrics (not only directly connected subnets)
-		for (Iface iface : this.interfaces.values())
-		{
-			if ((iface.getIpAddress() == 0) || (iface.getSubnetMask() == 0))
-			{ continue; }
-
-			int subnet = iface.getIpAddress() & iface.getSubnetMask();
-			RIPv2Entry entry = new RIPv2Entry(subnet, iface.getSubnetMask(), 1);
+		//loop through learned routes and attach all of them
+		//dont need to attach nexthop as if someone uses our route, OUR interface is thier next hop
+		for(LearnedRoute route : this.learnedRoutes.values()) {
+			RIPv2Entry entry = new RIPv2Entry(route.destinationAddress, route.subnetMask, route.metric);
 			rip.addEntry(entry);
 		}
+
+	}
+
+	//check if route has timed out
+	private boolean checkIfRouteHasTimedOut(int destAddr, int subnetMask) {
+		String routeKey = String.valueOf(destAddr) + "/" + String.valueOf(subnetMask);
+		LearnedRoute route = this.learnedRoutes.get(routeKey);
+		if(route == null) {
+			return false;
+		}
+		//if route is not direct and has timed out, remove it
+		if(!route.directRoute && route.lastUpdate + ROUTE_TIMEOUT_MS < System.currentTimeMillis()) {
+			//remove route from learned routes and route table
+			this.learnedRoutes.remove(routeKey);
+			this.routeTable.remove(destAddr, subnetMask);
+			return true;
+		}
+		return false;
+		
 	}
 
 	/**
@@ -333,7 +417,7 @@ public class Router extends Device
 			this.handleRIPPacket(etherPacket, ipPacket, inIface);
 			return;
 		}
-
+		
 		// ttl must stay positive after decrement
 		int ttl = ipPacket.getTtl() & 0xff;
 		if (ttl <= 1) {
@@ -354,6 +438,12 @@ public class Router extends Device
 		// longest-prefix route lookup
 		RouteEntry bestMatch = this.routeTable.lookup(dstIp);
 		if (bestMatch == null) {
+			
+			return;
+		}
+
+		//check if route has timed out
+		if(this.checkIfRouteHasTimedOut(bestMatch.getDestinationAddress(), bestMatch.getMaskAddress())) {
 			return;
 		}
 
@@ -386,5 +476,25 @@ public class Router extends Device
 		this.sendPacket(etherPacket, outIface);
 	}
 
-	// TODO: override destroy() to cancel RIP timers/tasks cleanly before calling super.destroy()
+	private LearnedRoute createLearnedRoute(int destAddr, int subnetMask, int metric, boolean directRoute){
+		LearnedRoute route = new LearnedRoute();
+		route.destinationAddress = destAddr;
+		route.subnetMask = subnetMask;
+		route.metric = metric;
+		route.lastUpdate = System.currentTimeMillis();
+		route.directRoute = directRoute;
+		return route;
+
+	}
+	/**
+	 * Cancel RIP timers/tasks cleanly before calling super.destroy()
+	 */
+	@Override
+	public void destroy() {
+		if(this.ripEnabled) {
+			this.ripResponseTimer.cancel();
+		}
+		super.destroy();
+	}
+
 }

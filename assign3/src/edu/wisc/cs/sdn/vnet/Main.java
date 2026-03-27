@@ -97,6 +97,7 @@ public class Main
 
 			// Start RIP only when no static route table is provided
 			if (routeTableFile == null)
+			System.out.println("starting RIP");
 			{ router.startRIP(); }
 		}
 

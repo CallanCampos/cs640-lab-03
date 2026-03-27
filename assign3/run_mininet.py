@@ -317,7 +317,7 @@ def dijkstra(graph, initial):
 if __name__ == '__main__':
     setLogLevel( 'info' )
     if (len(sys.argv) < 2):
-        print sys.argv
+        print(sys.argv)
         sys.exit("%s <topofile> [-a]" % (sys.argv[0]))
     topofile = sys.argv[1]
     staticarp = False
