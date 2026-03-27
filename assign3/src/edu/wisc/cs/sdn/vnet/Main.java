@@ -97,8 +97,10 @@ public class Main
 
 			// Start RIP only when no static route table is provided
 			if (routeTableFile == null)
-			System.out.println("starting RIP");
-			{ router.startRIP(); }
+			{
+				System.out.println("Starting RIP");
+				router.startRIP();
+			}
 		}
 
 		// Read messages from the server until the server closes the connection
